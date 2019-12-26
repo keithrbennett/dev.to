@@ -21,26 +21,35 @@ module Notifications
       end
 
       def call
-        recent_follows = Follow.where(followable_type: followable_type, followable_id: followable_id).
+        # All recent Follows having the specified followable id and type.
+        recent_follows_of_followable_id_and_type = Follow.where(followable_type: followable_type, followable_id: followable_id).
           where("created_at > ?", 24.hours.ago).order("created_at DESC")
 
-        notification_params = { action: "Follow" }
-        if followable_type == "User"
-          notification_params[:user_id] = followable_id
-        elsif followable_type == "Organization"
-          notification_params[:organization_id] = followable_id
-        end
+        notification_params = build_notification_params_from_followable
 
-        followers = User.where(id: recent_follows.select(:follower_id))
-        aggregated_siblings = followers.map { |follower| user_data(follower) }
-        if aggregated_siblings.size.zero?
+        # Move the empty result handling higher up in the method.
+        # (If followers was empty, recent_follows would need to be too, right?)
+        # When is this called? Is it only called in response to a new follow, and if so, would recent_follows ever be empty?
+        if recent_follows_of_followable_id_and_type.empty?
+
+          # In these notification params, we specify only the followed, not the follower.
+          # Is this correct? Is there only one Notification instance per followed?
+          # If so, then we would be deleting a notification triggered by a different follower, right? Is this ok?
           notification = Notification.find_by(notification_params)&.destroy
         else
-          json_data = { user: user_data(follower), aggregated_siblings: aggregated_siblings }
           notification = Notification.find_or_initialize_by(notification_params)
-          notification.notifiable_id = recent_follows.first.id
+
+          # Previous implementation changed by @rhymes in PR #5236 to next code line
+          # notification.notifiable_id = recent_follows.first.id
+
+          # This line will set the notifiable to the follower id if it occurs in the followers, or nil if not.
+          # If not, would we even be here? Is it possible for this to be called if not?
+          # Could we not instead just do: notification.notifiable_id = @follower_id?
+          # (Also, do we want '@follower_id' here, or just use the attr_reader `follower_id` instead?)
+          notification.notifiable_id = recent_follows_of_followable_id_and_type.detect { |f| f.follower_id == @follower_id }&.id
+
           notification.notifiable_type = "Follow"
-          notification.json_data = json_data
+          notification.json_data = create_json_data(recent_follows_of_followable_id_and_type)
           notification.notified_at = Time.current
           notification.read = is_read
           notification.save!
@@ -54,6 +63,29 @@ module Notifications
 
       def follower
         User.find(follower_id)
+      end
+
+      def build_notification_params_from_followable
+        params = { action: "Follow" }
+        if followable_type == "User"
+          params[:user_id] = followable_id
+        elsif followable_type == "Organization"
+          params[:organization_id] = followable_id
+        end
+        params
+      end
+
+      def create_json_data(recent_follows_of_followable_id_and_type)
+        # All Users corresponding to the above Follows
+        followers = User.where(id: recent_follows_of_followable_id_and_type.select(:follower_id))
+
+        # This block-local variable shadows the instance method by the same name. Change it?
+        # follower_hashes = followers.map { |follower| user_data(follower) }
+        follower_hashes = followers.map { |f| user_data(f) }
+
+        # follower_hashes will include all followers, including the user in question, is that right and ok?
+        # (Should this follower be included in the aggregated_siblings?)
+        { user: user_data(follower), aggregated_siblings: follower_hashes }
       end
     end
   end
